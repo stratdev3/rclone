@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -249,6 +250,10 @@ func init() {
 				return nil, nil
 			}
 			return nil, fmt.Errorf("unknown state %q", config.State)
+		},
+		MetadataInfo: &fs.MetadataInfo{
+			System: systemMetadataInfo,
+			Help:   `User metadata is stored in the properties field of the drive object.`,
 		},
 		Options: append(driveOAuthOptions(), []fs.Option{{
 			Name: "scope",
@@ -656,6 +661,66 @@ having trouble with like many empty directories.
 	}
 }
 
+// system metadata keys which this backend owns
+var systemMetadataInfo = map[string]fs.MetadataHelp{
+	"content-type": {
+		Help:    "The MIME type of the file.",
+		Type:    "string",
+		Example: "text/plain",
+	},
+	"mtime": {
+		Help:    "Time of last modification with mS accuracy.",
+		Type:    "RFC 3339",
+		Example: "2006-01-02T15:04:05.999Z07:00",
+	},
+	"btime": {
+		Help:    "Time of file birth (creation) with mS accuracy.",
+		Type:    "RFC 3339",
+		Example: "2006-01-02T15:04:05.999Z07:00",
+	},
+	"copy-requires-writer-permission": {
+		Help:    "Whether the options to copy, print, or download this file, should be disabled for readers and commenters.",
+		Type:    "boolean",
+		Example: "true",
+	},
+	"writers-can-share": {
+		Help:    "Whether users with only writer permission can modify the file's permissions. Not populated for items in shared drives.",
+		Type:    "boolean",
+		Example: "false",
+	},
+	"viewed-by-me": {
+		Help:     "Whether the file has been viewed by this user.",
+		Type:     "boolean",
+		Example:  "true",
+		ReadOnly: true,
+	},
+	"owner": {
+		Help:    "The owner of the file. Usually an email address.",
+		Type:    "string",
+		Example: "user@example.com",
+	},
+	"permissions": {
+		Help:    "Permissions in a JSON dump of Google drive format.",
+		Type:    "JSON",
+		Example: "{}",
+	},
+	"folder-color-rgb": {
+		Help:    "The color for a folder or a shortcut to a folder as an RGB hex string.",
+		Type:    "string",
+		Example: "881133",
+	},
+	"description": {
+		Help:    "A short description of the file.",
+		Type:    "string",
+		Example: "Contract for signing",
+	},
+	"starred": {
+		Help:    "Whether the user has starred the file.",
+		Type:    "boolean",
+		Example: "false",
+	},
+}
+
 // Options defines the configuration for this backend
 type Options struct {
 	Scope                     string               `config:"scope"`
@@ -718,10 +783,12 @@ type Fs struct {
 	isTeamDrive      bool               // true if this is a team drive
 	fileFields       googleapi.Field    // fields to fetch file info with
 	m                configmap.Mapper
-	grouping         int32               // number of IDs to search at once in ListR - read with atomic
-	listRmu          *sync.Mutex         // protects listRempties
-	listRempties     map[string]struct{} // IDs of supposedly empty directories which triggered grouping disable
-	dirResourceKeys  *sync.Map           // map directory ID to resource key
+	grouping         int32                        // number of IDs to search at once in ListR - read with atomic
+	listRmu          *sync.Mutex                  // protects listRempties
+	listRempties     map[string]struct{}          // IDs of supposedly empty directories which triggered grouping disable
+	dirResourceKeys  *sync.Map                    // map directory ID to resource key
+	permissionsMu    *sync.Mutex                  // protect the below
+	permissions      map[string]*drive.Permission // map permission IDs to Permissions
 }
 
 type baseObject struct {
@@ -1255,6 +1322,8 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 		listRmu:         new(sync.Mutex),
 		listRempties:    make(map[string]struct{}),
 		dirResourceKeys: new(sync.Map),
+		permissionsMu:   new(sync.Mutex),
+		permissions:     make(map[string]*drive.Permission),
 	}
 	f.isTeamDrive = opt.TeamDriveID != ""
 	f.fileFields = f.getFileFields()
@@ -1265,6 +1334,9 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 		CanHaveEmptyDirectories: true,
 		ServerSideAcrossConfigs: opt.ServerSideAcrossConfigs,
 		FilterAware:             true,
+		ReadMetadata:            true,
+		WriteMetadata:           true,
+		UserMetadata:            true,
 	}).Fill(ctx, f)
 
 	// Create a new authorized Drive client.
@@ -3922,6 +3994,55 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		MimeType:     srcMimeType,
 		ModifiedTime: src.ModTime(ctx).Format(timeFormatOut),
 	}
+
+	// Fetch metadata if --metadata is in use
+	meta, err := fs.GetMetadataOptions(ctx, src, options)
+	if err != nil {
+		return fmt.Errorf("failed to read metadata from source object: %w", err)
+	}
+	updateInfo.Properties = make(map[string]string, len(meta)+2)
+	// merge metadata into request and user metadata
+	for k, v := range meta {
+		switch k {
+		case "copy-requires-writer-permission":
+			if b, err := strconv.ParseBool(v); err != nil {
+				fs.Errorf(o, "Can't parse metadata %q = %q: %v", k, v, err)
+			} else {
+				updateInfo.CopyRequiresWriterPermission = b
+			}
+		case "writers-can-share":
+			if b, err := strconv.ParseBool(v); err != nil {
+				fs.Errorf(o, "Can't parse metadata %q = %q: %v", k, v, err)
+			} else {
+				updateInfo.WritersCanShare = b
+			}
+		case "viewed-by-me":
+			// Can't write this
+		case "content-type":
+			updateInfo.MimeType = v
+		case "owner":
+			fs.Debugf(o, "FIXME ignoring metadata %q = %q", k, v)
+		case "permissions":
+			fs.Debugf(o, "FIXME ignoring metadata %q = %q", k, v)
+		case "folder-color-rgb":
+			updateInfo.FolderColorRgb = v
+		case "description":
+			updateInfo.Description = v
+		case "starred":
+			if b, err := strconv.ParseBool(v); err != nil {
+				fs.Errorf(o, "Can't parse metadata %q = %q: %v", k, v, err)
+			} else {
+				updateInfo.Starred = b
+			}
+		case "btime":
+			updateInfo.CreatedTime = v
+		case "mtime":
+			updateInfo.ModifiedTime = v
+		default:
+			updateInfo.Properties[k] = v
+		}
+	}
+
 	info, err := o.baseObject.update(ctx, updateInfo, srcMimeType, in, src)
 	if err != nil {
 		return err
@@ -4011,6 +4132,137 @@ func (o *baseObject) ParentID() string {
 	return ""
 }
 
+var permissionsFields = googleapi.Field(strings.Join([]string{
+	"id",
+	"displayName",
+	"emailAddress",
+	"role",
+	"type",
+	//"permissionDetails",
+	//"permissionDetails/inherited",
+}, ","))
+
+// getPermission returns permissions for the fileID and permissionID passed in
+func (f *Fs) getPermission(ctx context.Context, fileID, permissionID string) (info *drive.Permission, err error) {
+	f.permissionsMu.Lock()
+	defer f.permissionsMu.Unlock()
+	info = f.permissions[permissionID]
+	if info != nil {
+		return info, nil
+	}
+	err = f.pacer.Call(func() (bool, error) {
+		info, err = f.svc.Permissions.Get(fileID, permissionID).
+			Fields(permissionsFields).
+			SupportsAllDrives(true).
+			Context(ctx).Do()
+		return f.shouldRetry(ctx, err)
+	})
+	if err == nil {
+		f.permissions[permissionID] = info
+	}
+	return info, err
+}
+
+var metadataFields = googleapi.Field(strings.Join([]string{
+	"id",
+	"copyRequiresWriterPermission",
+	"writersCanShare",
+	"viewedByMe",
+	"mimeType",
+	"owners",
+	//"permissions",
+	"permissions/permissionDetails/inherited",
+	"folderColorRgb",
+	"description",
+	"starred",
+	"createdTime",
+	"modifiedTime",
+	"viewedByMeTime",
+	"properties",
+	"permissionIds",
+}, ","))
+
+// Metadata returns metadata for an object
+//
+// It should return nil if there is no Metadata
+func (o *Object) Metadata(ctx context.Context) (metadata fs.Metadata, err error) {
+	id := actualID(o.id)
+	info, err := o.fs.getFile(ctx, id, metadataFields)
+	if err != nil {
+		return nil, err
+	}
+	metadata = make(fs.Metadata, 16)
+
+	// Dump user metadata first as it overrides system metadata
+	for k, v := range info.Properties {
+		metadata[k] = v
+	}
+
+	// System metadata
+	metadata["copy-requires-writer-permission"] = fmt.Sprint(info.CopyRequiresWriterPermission)
+	metadata["writers-can-share"] = fmt.Sprint(info.WritersCanShare)
+	metadata["viewed-by-me"] = fmt.Sprint(info.ViewedByMe)
+	metadata["content-type"] = info.MimeType
+
+	// Owners: Output only. The owner of this file. Only certain legacy
+	// files may have more than one owner. This field isn't populated for
+	// items in shared drives.
+	if len(info.Owners) > 0 {
+		user := info.Owners[0]
+		if len(info.Owners) > 1 {
+			fs.Debugf(o, "Ignoring more than 1 owner")
+		}
+		if user != nil {
+			id := user.EmailAddress
+			if id == "" {
+				id = user.DisplayName
+			}
+			metadata["owner"] = id
+		}
+	}
+
+	// FIXME to read the inherited permissions flag will mean we
+	// need to read the permissions for each object and the cache
+	// will be useless.
+
+	// PermissionIds: Output only. List of permission IDs for users with
+	// access to this file.
+	if len(info.PermissionIds) > 0 {
+		permissions := make([]*drive.Permission, 0, len(info.PermissionIds))
+		for _, permissionID := range info.PermissionIds {
+			info, err := o.fs.getPermission(ctx, id, permissionID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read permission: %w", err)
+			}
+			// if len(info.PermissionDetails) > 0 {
+			// 	// Don't write inherited permissions out
+			// 	if info.PermissionDetails[0].Inherited {
+			// 		continue
+			// 	}
+			// }
+			permissions = append(permissions, info)
+		}
+		if len(permissions) > 0 {
+			buf, err := json.Marshal(permissions)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal permissions: %w", err)
+			}
+			metadata["permissions"] = string(buf)
+		}
+	}
+
+	if info.FolderColorRgb != "" {
+		metadata["folder-color-rgb"] = info.FolderColorRgb
+	}
+	if info.Description != "" {
+		metadata["description"] = info.Description
+	}
+	metadata["starred"] = fmt.Sprint(info.Starred)
+	metadata["btime"] = info.CreatedTime
+	metadata["mtime"] = info.ModifiedTime
+	return metadata, nil
+}
+
 func (o *documentObject) ext() string {
 	return o.baseObject.remote[len(o.baseObject.remote)-o.extLen:]
 }
@@ -4072,6 +4324,7 @@ var (
 	_ fs.MimeTyper       = (*Object)(nil)
 	_ fs.IDer            = (*Object)(nil)
 	_ fs.ParentIDer      = (*Object)(nil)
+	_ fs.Metadataer      = (*Object)(nil)
 	_ fs.Object          = (*documentObject)(nil)
 	_ fs.MimeTyper       = (*documentObject)(nil)
 	_ fs.IDer            = (*documentObject)(nil)
