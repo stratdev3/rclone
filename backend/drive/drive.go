@@ -48,6 +48,7 @@ import (
 	"github.com/rclone/rclone/lib/readers"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	"golang.org/x/sync/errgroup"
 	drive_v2 "google.golang.org/api/drive/v2"
 	drive "google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
@@ -792,14 +793,15 @@ type Fs struct {
 }
 
 type baseObject struct {
-	fs           *Fs      // what this object is part of
-	remote       string   // The remote path
-	id           string   // Drive Id of this object
-	modifiedDate string   // RFC3339 time it was last modified
-	mimeType     string   // The object MIME type
-	bytes        int64    // size of the object
-	parents      []string // IDs of the parent directories
-	resourceKey  *string  // resourceKey is needed for link shared objects
+	fs           *Fs          // what this object is part of
+	remote       string       // The remote path
+	id           string       // Drive Id of this object
+	modifiedDate string       // RFC3339 time it was last modified
+	mimeType     string       // The object MIME type
+	bytes        int64        // size of the object
+	parents      []string     // IDs of the parent directories
+	resourceKey  *string      // resourceKey is needed for link shared objects
+	metadata     *fs.Metadata // metadata if known
 }
 type documentObject struct {
 	baseObject
@@ -1441,7 +1443,7 @@ func NewFs(ctx context.Context, name, path string, m configmap.Mapper) (fs.Fs, e
 	return f, nil
 }
 
-func (f *Fs) newBaseObject(remote string, info *drive.File) baseObject {
+func (f *Fs) newBaseObject(ctx context.Context, remote string, info *drive.File) (o baseObject, err error) {
 	modifiedDate := info.ModifiedTime
 	if f.opt.UseCreatedDate {
 		modifiedDate = info.CreatedTime
@@ -1452,7 +1454,7 @@ func (f *Fs) newBaseObject(remote string, info *drive.File) baseObject {
 	if f.opt.SizeAsQuota {
 		size = info.QuotaBytesUsed
 	}
-	return baseObject{
+	o = baseObject{
 		fs:           f,
 		remote:       remote,
 		id:           info.Id,
@@ -1461,7 +1463,26 @@ func (f *Fs) newBaseObject(remote string, info *drive.File) baseObject {
 		bytes:        size,
 		parents:      info.Parents,
 	}
+	err = nil
+	if f.ci.Metadata {
+		err = o.parseMetadata(ctx, info)
+	}
+	return o, err
 }
+
+var metadataFields = googleapi.Field(strings.Join([]string{
+	"copyRequiresWriterPermission",
+	"description",
+	"folderColorRgb",
+	"owners",
+	"permissionIds",
+	"permissions/permissionDetails/inherited",
+	"properties",
+	"starred",
+	"viewedByMe",
+	"viewedByMeTime",
+	"writersCanShare",
+}, ","))
 
 // getFileFields gets the fields for a normal file Get or List
 func (f *Fs) getFileFields() (fields googleapi.Field) {
@@ -1478,11 +1499,14 @@ func (f *Fs) getFileFields() (fields googleapi.Field) {
 	if f.opt.SizeAsQuota {
 		fields += ",quotaBytesUsed"
 	}
+	if f.ci.Metadata {
+		fields += "," + metadataFields
+	}
 	return fields
 }
 
 // newRegularObject creates an fs.Object for a normal drive.File
-func (f *Fs) newRegularObject(remote string, info *drive.File) fs.Object {
+func (f *Fs) newRegularObject(ctx context.Context, remote string, info *drive.File) (obj fs.Object, err error) {
 	// wipe checksum if SkipChecksumGphotos and file is type Photo or Video
 	if f.opt.SkipChecksumGphotos {
 		for _, space := range info.Spaces {
@@ -1495,27 +1519,33 @@ func (f *Fs) newRegularObject(remote string, info *drive.File) fs.Object {
 		}
 	}
 	o := &Object{
-		baseObject: f.newBaseObject(remote, info),
 		url:        fmt.Sprintf("%sfiles/%s?alt=media", f.svc.BasePath, actualID(info.Id)),
 		md5sum:     strings.ToLower(info.Md5Checksum),
 		sha1sum:    strings.ToLower(info.Sha1Checksum),
 		sha256sum:  strings.ToLower(info.Sha256Checksum),
 		v2Download: f.opt.V2DownloadMinSize != -1 && info.Size >= int64(f.opt.V2DownloadMinSize),
 	}
+	o.baseObject, err = f.newBaseObject(ctx, remote, info)
+	if err != nil {
+		return nil, err
+	}
 	if info.ResourceKey != "" {
 		o.resourceKey = &info.ResourceKey
 	}
-	return o
+	return o, nil
 }
 
 // newDocumentObject creates an fs.Object for a google docs drive.File
-func (f *Fs) newDocumentObject(remote string, info *drive.File, extension, exportMimeType string) (fs.Object, error) {
+func (f *Fs) newDocumentObject(ctx context.Context, remote string, info *drive.File, extension, exportMimeType string) (fs.Object, error) {
 	mediaType, _, err := mime.ParseMediaType(exportMimeType)
 	if err != nil {
 		return nil, err
 	}
 	url := info.ExportLinks[mediaType]
-	baseObject := f.newBaseObject(remote+extension, info)
+	baseObject, err := f.newBaseObject(ctx, remote+extension, info)
+	if err != nil {
+		return nil, err
+	}
 	baseObject.bytes = -1
 	baseObject.mimeType = exportMimeType
 	return &documentObject{
@@ -1527,7 +1557,7 @@ func (f *Fs) newDocumentObject(remote string, info *drive.File, extension, expor
 }
 
 // newLinkObject creates an fs.Object that represents a link a google docs drive.File
-func (f *Fs) newLinkObject(remote string, info *drive.File, extension, exportMimeType string) (fs.Object, error) {
+func (f *Fs) newLinkObject(ctx context.Context, remote string, info *drive.File, extension, exportMimeType string) (fs.Object, error) {
 	t := linkTemplate(exportMimeType)
 	if t == nil {
 		return nil, fmt.Errorf("unsupported link type %s", exportMimeType)
@@ -1546,7 +1576,10 @@ func (f *Fs) newLinkObject(remote string, info *drive.File, extension, exportMim
 		return nil, fmt.Errorf("executing template failed: %w", err)
 	}
 
-	baseObject := f.newBaseObject(remote+extension, info)
+	baseObject, err := f.newBaseObject(ctx, remote+extension, info)
+	if err != nil {
+		return nil, err
+	}
 	baseObject.bytes = int64(buf.Len())
 	baseObject.mimeType = exportMimeType
 	return &linkObject{
@@ -1562,7 +1595,7 @@ func (f *Fs) newLinkObject(remote string, info *drive.File, extension, exportMim
 func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *drive.File) (fs.Object, error) {
 	// If item has MD5 sum it is a file stored on drive
 	if info.Md5Checksum != "" {
-		return f.newRegularObject(remote, info), nil
+		return f.newRegularObject(ctx, remote, info)
 	}
 
 	extension, exportName, exportMimeType, isDocument := f.findExportFormat(ctx, info)
@@ -1593,10 +1626,10 @@ func (f *Fs) newObjectWithExportInfo(
 	case info.MimeType == shortcutMimeTypeDangling:
 		// Pretend a dangling shortcut is a regular object
 		// It will error if used, but appear in listings so it can be deleted
-		return f.newRegularObject(remote, info), nil
+		return f.newRegularObject(ctx, remote, info)
 	case info.Md5Checksum != "":
 		// If item has MD5 sum it is a file stored on drive
-		return f.newRegularObject(remote, info), nil
+		return f.newRegularObject(ctx, remote, info)
 	case f.opt.SkipGdocs:
 		fs.Debugf(remote, "Skipping google document type %q", info.MimeType)
 		return nil, fs.ErrorObjectNotFound
@@ -1611,9 +1644,9 @@ func (f *Fs) newObjectWithExportInfo(
 			return nil, fs.ErrorObjectNotFound
 		}
 		if isLinkMimeType(exportMimeType) {
-			return f.newLinkObject(remote, info, extension, exportMimeType)
+			return f.newLinkObject(ctx, remote, info, extension, exportMimeType)
 		}
-		return f.newDocumentObject(remote, info, extension, exportMimeType)
+		return f.newDocumentObject(ctx, remote, info, extension, exportMimeType)
 	}
 }
 
@@ -4150,6 +4183,7 @@ func (f *Fs) getPermission(ctx context.Context, fileID, permissionID string) (in
 	if info != nil {
 		return info, nil
 	}
+	fs.Debugf(f, "Fetching permission %q", permissionID)
 	err = f.pacer.Call(func() (bool, error) {
 		info, err = f.svc.Permissions.Get(fileID, permissionID).
 			Fields(permissionsFields).
@@ -4163,35 +4197,12 @@ func (f *Fs) getPermission(ctx context.Context, fileID, permissionID string) (in
 	return info, err
 }
 
-var metadataFields = googleapi.Field(strings.Join([]string{
-	"id",
-	"copyRequiresWriterPermission",
-	"writersCanShare",
-	"viewedByMe",
-	"mimeType",
-	"owners",
-	//"permissions",
-	"permissions/permissionDetails/inherited",
-	"folderColorRgb",
-	"description",
-	"starred",
-	"createdTime",
-	"modifiedTime",
-	"viewedByMeTime",
-	"properties",
-	"permissionIds",
-}, ","))
-
-// Metadata returns metadata for an object
+// Parse the metadata from drive item
 //
 // It should return nil if there is no Metadata
-func (o *Object) Metadata(ctx context.Context) (metadata fs.Metadata, err error) {
-	id := actualID(o.id)
-	info, err := o.fs.getFile(ctx, id, metadataFields)
-	if err != nil {
-		return nil, err
-	}
-	metadata = make(fs.Metadata, 16)
+func (o *baseObject) parseMetadata(ctx context.Context, info *drive.File) (err error) {
+	fs.Debugf(o, "parseMetadata")
+	metadata := make(fs.Metadata, 16)
 
 	// Dump user metadata first as it overrides system metadata
 	for k, v := range info.Properties {
@@ -4228,27 +4239,35 @@ func (o *Object) Metadata(ctx context.Context) (metadata fs.Metadata, err error)
 	// PermissionIds: Output only. List of permission IDs for users with
 	// access to this file.
 	if len(info.PermissionIds) > 0 {
-		permissions := make([]*drive.Permission, 0, len(info.PermissionIds))
-		for _, permissionID := range info.PermissionIds {
-			info, err := o.fs.getPermission(ctx, id, permissionID)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read permission: %w", err)
-			}
-			// if len(info.PermissionDetails) > 0 {
-			// 	// Don't write inherited permissions out
-			// 	if info.PermissionDetails[0].Inherited {
-			// 		continue
-			// 	}
-			// }
-			permissions = append(permissions, info)
+		permissions := make([]*drive.Permission, len(info.PermissionIds))
+		g, gCtx := errgroup.WithContext(ctx)
+		g.SetLimit(o.fs.ci.Checkers)
+		for i, permissionID := range info.PermissionIds {
+			i, permissionID := i, permissionID
+			g.Go(func() error {
+				info, err := o.fs.getPermission(gCtx, actualID(info.Id), permissionID)
+				if err != nil {
+					return fmt.Errorf("failed to read permission: %w", err)
+				}
+				// if len(info.PermissionDetails) > 0 {
+				// 	// Don't write inherited permissions out
+				// 	if info.PermissionDetails[0].Inherited {
+				// 		continue
+				// 	}
+				// }
+				permissions[i] = info
+				return nil
+			})
 		}
-		if len(permissions) > 0 {
-			buf, err := json.Marshal(permissions)
-			if err != nil {
-				return nil, fmt.Errorf("failed to marshal permissions: %w", err)
-			}
-			metadata["permissions"] = string(buf)
+		err = g.Wait()
+		if err != nil {
+			return err
 		}
+		buf, err := json.Marshal(permissions)
+		if err != nil {
+			return fmt.Errorf("failed to marshal permissions: %w", err)
+		}
+		metadata["permissions"] = string(buf)
 	}
 
 	if info.FolderColorRgb != "" {
@@ -4260,7 +4279,29 @@ func (o *Object) Metadata(ctx context.Context) (metadata fs.Metadata, err error)
 	metadata["starred"] = fmt.Sprint(info.Starred)
 	metadata["btime"] = info.CreatedTime
 	metadata["mtime"] = info.ModifiedTime
-	return metadata, nil
+
+	o.metadata = &metadata
+	return nil
+}
+
+// Metadata returns metadata for an object
+//
+// It should return nil if there is no Metadata
+func (o *Object) Metadata(ctx context.Context) (metadata fs.Metadata, err error) {
+	if o.metadata != nil {
+		return *o.metadata, nil
+	}
+	fs.Debugf(o, "Fetching metadata")
+	id := actualID(o.id)
+	info, err := o.fs.getFile(ctx, id, o.fs.fileFields)
+	if err != nil {
+		return nil, err
+	}
+	err = o.parseMetadata(ctx, info)
+	if err != nil {
+		return nil, err
+	}
+	return *o.metadata, nil
 }
 
 func (o *documentObject) ext() string {
