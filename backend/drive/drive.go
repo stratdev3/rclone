@@ -701,7 +701,7 @@ var systemMetadataInfo = map[string]fs.MetadataHelp{
 		Example: "user@example.com",
 	},
 	"permissions": {
-		Help:    "Permissions in a JSON dump of Google drive format.",
+		Help:    "Permissions in a JSON dump of Google drive format. On shared drives these will only be present if they aren't inherited.",
 		Type:    "JSON",
 		Example: "{}",
 	},
@@ -1474,9 +1474,10 @@ var metadataFields = googleapi.Field(strings.Join([]string{
 	"copyRequiresWriterPermission",
 	"description",
 	"folderColorRgb",
+	"hasAugmentedPermissions",
 	"owners",
 	"permissionIds",
-	"permissions/permissionDetails/inherited",
+	"permissions",
 	"properties",
 	"starred",
 	"viewedByMe",
@@ -4166,22 +4167,23 @@ func (o *baseObject) ParentID() string {
 }
 
 var permissionsFields = googleapi.Field(strings.Join([]string{
-	"id",
 	"displayName",
 	"emailAddress",
+	"id",
+	"permissionDetails",
 	"role",
 	"type",
-	//"permissionDetails",
-	//"permissionDetails/inherited",
 }, ","))
 
 // getPermission returns permissions for the fileID and permissionID passed in
-func (f *Fs) getPermission(ctx context.Context, fileID, permissionID string) (info *drive.Permission, err error) {
+func (f *Fs) getPermission(ctx context.Context, fileID, permissionID string, useCache bool) (info *drive.Permission, err error) {
 	f.permissionsMu.Lock()
 	defer f.permissionsMu.Unlock()
-	info = f.permissions[permissionID]
-	if info != nil {
-		return info, nil
+	if useCache {
+		info = f.permissions[permissionID]
+		if info != nil {
+			return info, nil
+		}
 	}
 	fs.Debugf(f, "Fetching permission %q", permissionID)
 	err = f.pacer.Call(func() (bool, error) {
@@ -4232,30 +4234,57 @@ func (o *baseObject) parseMetadata(ctx context.Context, info *drive.File) (err e
 		}
 	}
 
-	// FIXME to read the inherited permissions flag will mean we
-	// need to read the permissions for each object and the cache
-	// will be useless.
+	// We only write permissions out if they are not inherited.
+	//
+	// On My Drives permissions seem to be attached to every item
+	// so they will always be written out.
+	//
+	// On Shared Drives only non-inherited permissions will be
+	// written out.
+
+	// To read the inherited permissions flag will mean we need to
+	// read the permissions for each object and the cache will be
+	// useless. However shared drives don't return permissions
+	// only permissionIds so will need to fetch them for each
+	// object. We use HasAugmentedPermissions to see if there are
+	// special permissions before fetching them to save transactions.
+
+	// HasAugmentedPermissions: Output only. Whether there are permissions
+	// directly on this file. This field is only populated for items in
+	// shared drives.
+	if o.fs.isTeamDrive && !info.HasAugmentedPermissions {
+		// Don't process permissions if there aren't any specifically set
+		info.Permissions = nil
+		info.PermissionIds = nil
+	}
 
 	// PermissionIds: Output only. List of permission IDs for users with
 	// access to this file.
-	if len(info.PermissionIds) > 0 {
-		permissions := make([]*drive.Permission, len(info.PermissionIds))
+	//
+	// Only process these if we have no Permissions
+	if len(info.PermissionIds) > 0 && len(info.Permissions) == 0 {
+		info.Permissions = make([]*drive.Permission, 0, len(info.PermissionIds))
 		g, gCtx := errgroup.WithContext(ctx)
 		g.SetLimit(o.fs.ci.Checkers)
-		for i, permissionID := range info.PermissionIds {
-			i, permissionID := i, permissionID
+		var mu sync.Mutex // protect the info.Permissions from concurrent writes
+		for _, permissionID := range info.PermissionIds {
+			permissionID := permissionID
 			g.Go(func() error {
-				info, err := o.fs.getPermission(gCtx, actualID(info.Id), permissionID)
+				// must fetch the team drive ones individually to check the inherited flag
+				perm, err := o.fs.getPermission(gCtx, actualID(info.Id), permissionID, !o.fs.isTeamDrive)
 				if err != nil {
 					return fmt.Errorf("failed to read permission: %w", err)
 				}
-				// if len(info.PermissionDetails) > 0 {
-				// 	// Don't write inherited permissions out
-				// 	if info.PermissionDetails[0].Inherited {
-				// 		continue
-				// 	}
-				// }
-				permissions[i] = info
+				inherited := len(perm.PermissionDetails) > 0 && perm.PermissionDetails[0].Inherited
+				// Zero PermissionDetails since it can't be cached
+				perm.PermissionDetails = nil
+				// Don't write inherited permissions out
+				if inherited {
+					return nil
+				}
+				mu.Lock()
+				info.Permissions = append(info.Permissions, perm)
+				mu.Unlock()
 				return nil
 			})
 		}
@@ -4263,12 +4292,25 @@ func (o *baseObject) parseMetadata(ctx context.Context, info *drive.File) (err e
 		if err != nil {
 			return err
 		}
-		buf, err := json.Marshal(permissions)
+	}
+
+	// Permissions: Output only. The full list of permissions for the file.
+	// This is only available if the requesting user can share the file. Not
+	// populated for items in shared drives.
+	if len(info.Permissions) > 0 {
+		buf, err := json.Marshal(info.Permissions)
 		if err != nil {
 			return fmt.Errorf("failed to marshal permissions: %w", err)
 		}
 		metadata["permissions"] = string(buf)
 	}
+
+	// Permission propagation
+	// https://developers.google.com/drive/api/guides/manage-sharing#permission-propagation
+	// Leads me to believe that in non shared drives, permissions
+	// are added to each item when you set permissions for a
+	// folder whereas in shared drives they are inherited and
+	// placed on the item directly.
 
 	if info.FolderColorRgb != "" {
 		metadata["folder-color-rgb"] = info.FolderColorRgb
