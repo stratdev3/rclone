@@ -4167,36 +4167,79 @@ func (o *baseObject) ParentID() string {
 }
 
 var permissionsFields = googleapi.Field(strings.Join([]string{
-	"displayName",
-	"emailAddress",
-	"id",
-	"permissionDetails",
-	"role",
-	"type",
+	"*",
+	"permissionDetails/*",
 }, ","))
 
 // getPermission returns permissions for the fileID and permissionID passed in
-func (f *Fs) getPermission(ctx context.Context, fileID, permissionID string, useCache bool) (info *drive.Permission, err error) {
+func (f *Fs) getPermission(ctx context.Context, fileID, permissionID string, useCache bool) (perm *drive.Permission, inherited bool, err error) {
 	f.permissionsMu.Lock()
 	defer f.permissionsMu.Unlock()
 	if useCache {
-		info = f.permissions[permissionID]
-		if info != nil {
-			return info, nil
+		perm = f.permissions[permissionID]
+		if perm != nil {
+			return perm, false, nil
 		}
 	}
 	fs.Debugf(f, "Fetching permission %q", permissionID)
 	err = f.pacer.Call(func() (bool, error) {
-		info, err = f.svc.Permissions.Get(fileID, permissionID).
+		perm, err = f.svc.Permissions.Get(fileID, permissionID).
 			Fields(permissionsFields).
 			SupportsAllDrives(true).
 			Context(ctx).Do()
 		return f.shouldRetry(ctx, err)
 	})
-	if err == nil {
-		f.permissions[permissionID] = info
+	if err != nil {
+		return nil, false, err
 	}
-	return info, err
+
+	inherited = len(perm.PermissionDetails) > 0 && perm.PermissionDetails[0].Inherited
+
+	cleanPermission(perm)
+
+	// cache the permission
+	f.permissions[permissionID] = perm
+
+	return perm, inherited, err
+}
+
+// Clean and cache the permission if not already cached
+func (f *Fs) cleanAndCachePermission(perm *drive.Permission) {
+	f.permissionsMu.Lock()
+	defer f.permissionsMu.Unlock()
+	cleanPermission(perm)
+	if _, found := f.permissions[perm.Id]; !found {
+		f.permissions[perm.Id] = perm
+	}
+}
+
+// Clean fields we don't need to keep from the permission
+func cleanPermission(perm *drive.Permission) {
+	// DisplayName: Output only. The "pretty" name of the value of the
+	// permission. The following is a list of examples for each type of
+	// permission: * `user` - User's full name, as defined for their Google
+	// account, such as "Joe Smith." * `group` - Name of the Google Group,
+	// such as "The Company Administrators." * `domain` - String domain
+	// name, such as "thecompany.com." * `anyone` - No `displayName` is
+	// present.
+	perm.DisplayName = ""
+
+	// Kind: Output only. Identifies what kind of resource this is. Value:
+	// the fixed string "drive#permission".
+	perm.Kind = ""
+
+	// PermissionDetails: Output only. Details of whether the permissions on
+	// this shared drive item are inherited or directly on this item. This
+	// is an output-only field which is present only for shared drive items.
+	perm.PermissionDetails = nil
+
+	// PhotoLink: Output only. A link to the user's profile photo, if
+	// available.
+	perm.PhotoLink = ""
+
+	// TeamDrivePermissionDetails: Output only. Deprecated: Output only. Use
+	// `permissionDetails` instead.
+	perm.TeamDrivePermissionDetails = nil
 }
 
 // Parse the metadata from drive item
@@ -4271,13 +4314,10 @@ func (o *baseObject) parseMetadata(ctx context.Context, info *drive.File) (err e
 			permissionID := permissionID
 			g.Go(func() error {
 				// must fetch the team drive ones individually to check the inherited flag
-				perm, err := o.fs.getPermission(gCtx, actualID(info.Id), permissionID, !o.fs.isTeamDrive)
+				perm, inherited, err := o.fs.getPermission(gCtx, actualID(info.Id), permissionID, !o.fs.isTeamDrive)
 				if err != nil {
 					return fmt.Errorf("failed to read permission: %w", err)
 				}
-				inherited := len(perm.PermissionDetails) > 0 && perm.PermissionDetails[0].Inherited
-				// Zero PermissionDetails since it can't be cached
-				perm.PermissionDetails = nil
 				// Don't write inherited permissions out
 				if inherited {
 					return nil
@@ -4291,6 +4331,11 @@ func (o *baseObject) parseMetadata(ctx context.Context, info *drive.File) (err e
 		err = g.Wait()
 		if err != nil {
 			return err
+		}
+	} else {
+		// Clean the fetched permissions
+		for _, perm := range info.Permissions {
+			o.fs.cleanAndCachePermission(perm)
 		}
 	}
 
