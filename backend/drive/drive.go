@@ -143,6 +143,26 @@ var (
 	_linkTemplates   map[string]*template.Template // available link types
 )
 
+// rwChoices type for fs.Enum
+type rwChoices struct{}
+
+func (rwChoices) Choices() []string {
+	return []string{
+		rwOff:   "off",
+		rwRead:  "read",
+		rwWrite: "write",
+	}
+}
+
+// rwChoice type alias
+type rwChoice = fs.Enum[rwChoices]
+
+const (
+	rwOff rwChoice = iota
+	rwRead
+	rwWrite
+)
+
 // Parse the scopes option returning a slice of scopes
 func driveScopes(scopesString string) (scopes []string) {
 	if scopesString == "" {
@@ -625,6 +645,33 @@ having trouble with like many empty directories.
 			Advanced: true,
 			Default:  true,
 		}, {
+			Name: "metadata_permissions",
+			Help: `Control whether permissions should be read or written in metadata.
+
+Reading permissions metadata from files can be done quickly, but it
+isn't always desirable to set the permissions from the metadata.
+
+- Set to "off" to not read or write permissions to or from metadata.
+- Set to "read" to read permissions and output them in the metadata.
+- Set to "write" to read and write permissions from incoming metadata into uploaded files.
+`,
+			Advanced: true,
+			Default:  rwOff,
+		}, {
+			Name: "metadata_labels",
+			Help: `Control whether labels should be read or written in metadata.
+
+Reading labels metadata from files takes an extra API transaction and
+will slow down listings. It isn't always desirable to set the labels
+from the metadata.
+
+- Set to "off" to not read or write labels to or from metadata.
+- Set to "read" to read labels and output them in the metadata.
+- Set to "write" to read and write labels from incoming metadata into uploaded files.
+`,
+			Advanced: true,
+			Default:  rwOff,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -699,6 +746,8 @@ type Options struct {
 	SkipDanglingShortcuts     bool                 `config:"skip_dangling_shortcuts"`
 	ResourceKey               string               `config:"resource_key"`
 	FastListBugFix            bool                 `config:"fast_list_bug_fix"`
+	MetadataPermissions       rwChoice             `config:"metadata_permissions"`
+	MetadataLabels            rwChoice             `config:"metadata_labels"`
 	Enc                       encoder.MultiEncoder `config:"encoding"`
 	EnvAuth                   bool                 `config:"env_auth"`
 }
