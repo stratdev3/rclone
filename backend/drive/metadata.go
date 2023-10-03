@@ -49,7 +49,7 @@ var systemMetadataInfo = map[string]fs.MetadataHelp{
 		ReadOnly: true,
 	},
 	"owner": {
-		Help:    "The owner of the file. Usually an email address.",
+		Help:    "The owner of the file. Usually an email address. Enable with --drive-metadata-owner.",
 		Type:    "string",
 		Example: "user@example.com",
 	},
@@ -241,7 +241,7 @@ func (o *baseObject) parseMetadata(ctx context.Context, info *drive.File) (err e
 	// Owners: Output only. The owner of this file. Only certain legacy
 	// files may have more than one owner. This field isn't populated for
 	// items in shared drives.
-	if len(info.Owners) > 0 {
+	if o.fs.opt.MetadataOwner.IsSet(rwRead) && len(info.Owners) > 0 {
 		user := info.Owners[0]
 		if len(info.Owners) > 1 {
 			fs.Debugf(o, "Ignoring more than 1 owner")
@@ -255,7 +255,7 @@ func (o *baseObject) parseMetadata(ctx context.Context, info *drive.File) (err e
 		}
 	}
 
-	if o.fs.opt.MetadataPermissions != rwOff {
+	if o.fs.opt.MetadataPermissions.IsSet(rwRead) {
 		// We only write permissions out if they are not inherited.
 		//
 		// On My Drives permissions seem to be attached to every item
@@ -347,7 +347,7 @@ func (o *baseObject) parseMetadata(ctx context.Context, info *drive.File) (err e
 	metadata["btime"] = info.CreatedTime
 	metadata["mtime"] = info.ModifiedTime
 
-	if o.fs.opt.MetadataLabels != rwOff {
+	if o.fs.opt.MetadataLabels.IsSet(rwRead) {
 		// FIXME would be really nice if we knew if files had labels
 		// before listing but we need to know all possible label IDs
 		// to get it in the listing.
@@ -414,6 +414,9 @@ func (f *Fs) updateMetadata(ctx context.Context, updateInfo *drive.File, meta fs
 		case "content-type":
 			updateInfo.MimeType = v
 		case "owner":
+			if f.opt.MetadataOwner.IsSet(rwWrite) {
+				continue
+			}
 			// Can't set Owners on upload so need to set afterwards
 			callbackFns = append(callbackFns, func(info *drive.File) error {
 				// updateInfo.Owners = []*drive.User{
@@ -423,7 +426,7 @@ func (f *Fs) updateMetadata(ctx context.Context, updateInfo *drive.File, meta fs
 				return nil
 			})
 		case "permissions":
-			if f.opt.MetadataPermissions != rwWrite {
+			if f.opt.MetadataPermissions.IsSet(rwWrite) {
 				continue
 			}
 			var perms []*drive.Permission
@@ -438,7 +441,7 @@ func (f *Fs) updateMetadata(ctx context.Context, updateInfo *drive.File, meta fs
 				return nil
 			})
 		case "labels":
-			if f.opt.MetadataLabels != rwWrite {
+			if f.opt.MetadataLabels.IsSet(rwWrite) {
 				continue
 			}
 			// Can't set Labels on upload so need to set afterwards

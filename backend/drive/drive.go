@@ -143,25 +143,40 @@ var (
 	_linkTemplates   map[string]*template.Template // available link types
 )
 
-// rwChoices type for fs.Enum
+// rwChoices type for fs.Bits
 type rwChoices struct{}
 
-func (rwChoices) Choices() []string {
-	return []string{
-		rwOff:   "off",
-		rwRead:  "read",
-		rwWrite: "write",
+func (rwChoices) Choices() []fs.BitsChoicesInfo {
+	return []fs.BitsChoicesInfo{
+		{uint64(rwOff), "off"},
+		{uint64(rwRead), "read"},
+		{uint64(rwWrite), "write"},
 	}
 }
 
 // rwChoice type alias
-type rwChoice = fs.Enum[rwChoices]
+type rwChoice = fs.Bits[rwChoices]
 
 const (
-	rwOff rwChoice = iota
-	rwRead
+	rwRead rwChoice = 1 << iota
 	rwWrite
+	rwOff rwChoice = 0
 )
+
+// Examples for the options
+var rwExamples = fs.OptionExamples{{
+	Value: rwOff.String(),
+	Help:  "Do not read or write the value",
+}, {
+	Value: rwRead.String(),
+	Help:  "Read the value only",
+}, {
+	Value: rwWrite.String(),
+	Help:  "Write the value only",
+}, {
+	Value: (rwRead | rwWrite).String(),
+	Help:  "Read and Write the value.",
+}}
 
 // Parse the scopes option returning a slice of scopes
 func driveScopes(scopesString string) (scopes []string) {
@@ -645,18 +660,25 @@ having trouble with like many empty directories.
 			Advanced: true,
 			Default:  true,
 		}, {
+			Name: "metadata_owner",
+			Help: `Control whether owner should be read or written in metadata.
+
+Owner is a standard part of the file metadata so is easy to read. But it
+isn't always desirable to set the owner from the metadata.
+`,
+			Advanced: true,
+			Default:  rwRead,
+			Examples: rwExamples,
+		}, {
 			Name: "metadata_permissions",
 			Help: `Control whether permissions should be read or written in metadata.
 
 Reading permissions metadata from files can be done quickly, but it
 isn't always desirable to set the permissions from the metadata.
-
-- Set to "off" to not read or write permissions to or from metadata.
-- Set to "read" to read permissions and output them in the metadata.
-- Set to "write" to read and write permissions from incoming metadata into uploaded files.
 `,
 			Advanced: true,
 			Default:  rwOff,
+			Examples: rwExamples,
 		}, {
 			Name: "metadata_labels",
 			Help: `Control whether labels should be read or written in metadata.
@@ -664,13 +686,10 @@ isn't always desirable to set the permissions from the metadata.
 Reading labels metadata from files takes an extra API transaction and
 will slow down listings. It isn't always desirable to set the labels
 from the metadata.
-
-- Set to "off" to not read or write labels to or from metadata.
-- Set to "read" to read labels and output them in the metadata.
-- Set to "write" to read and write labels from incoming metadata into uploaded files.
 `,
 			Advanced: true,
 			Default:  rwOff,
+			Examples: rwExamples,
 		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
@@ -746,6 +765,7 @@ type Options struct {
 	SkipDanglingShortcuts     bool                 `config:"skip_dangling_shortcuts"`
 	ResourceKey               string               `config:"resource_key"`
 	FastListBugFix            bool                 `config:"fast_list_bug_fix"`
+	MetadataOwner             rwChoice             `config:"metadata_owner"`
 	MetadataPermissions       rwChoice             `config:"metadata_permissions"`
 	MetadataLabels            rwChoice             `config:"metadata_labels"`
 	Enc                       encoder.MultiEncoder `config:"encoding"`
