@@ -148,9 +148,9 @@ type rwChoices struct{}
 
 func (rwChoices) Choices() []fs.BitsChoicesInfo {
 	return []fs.BitsChoicesInfo{
-		{uint64(rwOff), "off"},
-		{uint64(rwRead), "read"},
-		{uint64(rwWrite), "write"},
+		{Bit: uint64(rwOff), Name: "off"},
+		{Bit: uint64(rwRead), Name: "read"},
+		{Bit: uint64(rwWrite), Name: "write"},
 	}
 }
 
@@ -665,6 +665,11 @@ having trouble with like many empty directories.
 
 Owner is a standard part of the file metadata so is easy to read. But it
 isn't always desirable to set the owner from the metadata.
+
+Note that you can't set the owner on Shared Drives, and that setting
+ownership will generate an email to the new owner (this can't be
+disabled), and you can't transfer ownership to someone outside your
+organization.
 `,
 			Advanced: true,
 			Default:  rwRead,
@@ -675,6 +680,10 @@ isn't always desirable to set the owner from the metadata.
 
 Reading permissions metadata from files can be done quickly, but it
 isn't always desirable to set the permissions from the metadata.
+
+Note that rclone drops any inherited permissions on Shared Drives and
+any owner permission on My Drives as these are duplicated in the owner
+metadata.
 `,
 			Advanced: true,
 			Default:  rwOff,
@@ -686,6 +695,16 @@ isn't always desirable to set the permissions from the metadata.
 Reading labels metadata from files takes an extra API transaction and
 will slow down listings. It isn't always desirable to set the labels
 from the metadata.
+
+The format of labels is documented in the drive API documentation at
+https://developers.google.com/drive/api/reference/rest/v3/Label -
+rclone just provides a JSON dump of this format.
+
+When setting labels, the label and fields must already exist - rclone
+will not create them. This means that if you are transferring labels
+from two different accounts you will have to create the labels in
+advance and use the metadata mapper to translate the IDs between the
+two accounts.
 `,
 			Advanced: true,
 			Default:  rwOff,
@@ -2427,7 +2446,7 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 			return nil, err
 		}
 	}
-	err = updateMetadata(info)
+	err = updateMetadata(ctx, info)
 	if err != nil {
 		return nil, err
 	}
@@ -4038,7 +4057,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if err != nil {
 		return err
 	}
-	err = updateMetadata(info)
+	err = updateMetadata(ctx, info)
 	if err != nil {
 		return err
 	}

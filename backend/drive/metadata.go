@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/davecgh/go-spew/spew"
 	"github.com/rclone/rclone/fs"
 	"golang.org/x/sync/errgroup"
 	drive "google.golang.org/api/drive/v3"
@@ -134,6 +133,37 @@ func (f *Fs) getPermission(ctx context.Context, fileID, permissionID string, use
 	return perm, inherited, err
 }
 
+// Set the permissions on the info
+func (f *Fs) setPermissions(ctx context.Context, info *drive.File, permissions []*drive.Permission) (err error) {
+	for _, perm := range permissions {
+		if perm.Role == "owner" {
+			// ignore owner permissions - these are set with owner
+			continue
+		}
+		cleanPermissionForWrite(perm)
+		err = f.pacer.Call(func() (bool, error) {
+			_, err = f.svc.Permissions.Create(info.Id, perm).
+				SupportsAllDrives(true).
+				Context(ctx).Do()
+			return f.shouldRetry(ctx, err)
+		})
+		if err != nil {
+			return fmt.Errorf("failed to set permission: %w", err)
+		}
+	}
+	return nil
+}
+
+// Clean attributes from permissions which we can't write
+func cleanPermissionForWrite(perm *drive.Permission) {
+	perm.Deleted = false
+	perm.DisplayName = ""
+	perm.Id = ""
+	perm.Kind = ""
+	perm.PermissionDetails = nil
+	perm.TeamDrivePermissionDetails = nil
+}
+
 // Clean and cache the permission if not already cached
 func (f *Fs) cleanAndCachePermission(perm *drive.Permission) {
 	f.permissionsMu.Lock()
@@ -205,6 +235,64 @@ func (f *Fs) getLabels(ctx context.Context, fileID string) (labels []*drive.Labe
 	return labels, nil
 }
 
+// Set the labels on the info
+func (f *Fs) setLabels(ctx context.Context, info *drive.File, labels []*drive.Label) (err error) {
+	if len(labels) == 0 {
+		return nil
+	}
+	req := drive.ModifyLabelsRequest{}
+	for _, label := range labels {
+		req.LabelModifications = append(req.LabelModifications, &drive.LabelModification{
+			FieldModifications: labelFieldsToFieldModifications(label.Fields),
+			LabelId:            label.Id,
+		})
+	}
+	err = f.pacer.Call(func() (bool, error) {
+		_, err = f.svc.Files.ModifyLabels(info.Id, &req).
+			Context(ctx).Do()
+		return f.shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to set owner: %w", err)
+	}
+	return nil
+}
+
+// Convert label fields into something which can set the fields
+func labelFieldsToFieldModifications(fields map[string]drive.LabelField) (out []*drive.LabelFieldModification) {
+	for id, field := range fields {
+		var emails []string
+		for _, user := range field.User {
+			emails = append(emails, user.EmailAddress)
+		}
+		out = append(out, &drive.LabelFieldModification{
+			// FieldId: The ID of the field to be modified.
+			FieldId: id,
+
+			// SetDateValues: Replaces the value of a dateString Field with these
+			// new values. The string must be in the RFC 3339 full-date format:
+			// YYYY-MM-DD.
+			SetDateValues: field.DateString,
+
+			// SetIntegerValues: Replaces the value of an `integer` field with these
+			// new values.
+			SetIntegerValues: field.Integer,
+
+			// SetSelectionValues: Replaces a `selection` field with these new
+			// values.
+			SetSelectionValues: field.Selection,
+
+			// SetTextValues: Sets the value of a `text` field.
+			SetTextValues: field.Text,
+
+			// SetUserValues: Replaces a `user` field with these new values. The
+			// values must be valid email addresses.
+			SetUserValues: emails,
+		})
+	}
+	return out
+}
+
 // Clean fields we don't need to keep from the label
 func cleanLabel(label *drive.Label) {
 	// Kind: This is always drive#label
@@ -224,7 +312,6 @@ func cleanLabel(label *drive.Label) {
 //
 // It should return nil if there is no Metadata
 func (o *baseObject) parseMetadata(ctx context.Context, info *drive.File) (err error) {
-	fs.Debugf(o, "parseMetadata")
 	metadata := make(fs.Metadata, 16)
 
 	// Dump user metadata first as it overrides system metadata
@@ -244,7 +331,7 @@ func (o *baseObject) parseMetadata(ctx context.Context, info *drive.File) (err e
 	if o.fs.opt.MetadataOwner.IsSet(rwRead) && len(info.Owners) > 0 {
 		user := info.Owners[0]
 		if len(info.Owners) > 1 {
-			fs.Debugf(o, "Ignoring more than 1 owner")
+			fs.Logf(o, "Ignoring more than 1 owner")
 		}
 		if user != nil {
 			id := user.EmailAddress
@@ -299,6 +386,10 @@ func (o *baseObject) parseMetadata(ctx context.Context, info *drive.File) (err e
 					}
 					// Don't write inherited permissions out
 					if inherited {
+						return nil
+					}
+					// Don't write owner role out - these are covered by the owner metadata
+					if perm.Role == "owner" {
 						return nil
 					}
 					mu.Lock()
@@ -367,11 +458,37 @@ func (o *baseObject) parseMetadata(ctx context.Context, info *drive.File) (err e
 	return nil
 }
 
+// Set the owner on the info
+func (f *Fs) setOwner(ctx context.Context, info *drive.File, owner string) (err error) {
+	perm := drive.Permission{
+		Role:         "owner",
+		EmailAddress: owner,
+		// Type: The type of the grantee. Valid values are: * `user` * `group` *
+		// `domain` * `anyone` When creating a permission, if `type` is `user`
+		// or `group`, you must provide an `emailAddress` for the user or group.
+		// When `type` is `domain`, you must provide a `domain`. There isn't
+		// extra information required for an `anyone` type.
+		Type: "user",
+	}
+	err = f.pacer.Call(func() (bool, error) {
+		_, err = f.svc.Permissions.Create(info.Id, &perm).
+			SupportsAllDrives(true).
+			TransferOwnership(true).
+			// SendNotificationEmail(false). - required apparently!
+			Context(ctx).Do()
+		return f.shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to set owner: %w", err)
+	}
+	return nil
+}
+
 // Call back to set metadata that can't be set on the upload/update
 //
 // The *drive.File passed in holds the current state of the drive.File
 // and this should update it with any modifications.
-type updateMetadataFn func(*drive.File) error
+type updateMetadataFn func(context.Context, *drive.File) error
 
 // read the metadata from meta and write it into updateInfo
 //
@@ -379,9 +496,9 @@ type updateMetadataFn func(*drive.File) error
 // after the data is uploaded.
 func (f *Fs) updateMetadata(ctx context.Context, updateInfo *drive.File, meta fs.Metadata) (callback updateMetadataFn, err error) {
 	callbackFns := []updateMetadataFn{}
-	callback = func(info *drive.File) error {
+	callback = func(ctx context.Context, info *drive.File) error {
 		for _, fn := range callbackFns {
-			err := fn(info)
+			err := fn(ctx, info)
 			if err != nil {
 				return err
 			}
@@ -414,19 +531,15 @@ func (f *Fs) updateMetadata(ctx context.Context, updateInfo *drive.File, meta fs
 		case "content-type":
 			updateInfo.MimeType = v
 		case "owner":
-			if f.opt.MetadataOwner.IsSet(rwWrite) {
+			if !f.opt.MetadataOwner.IsSet(rwWrite) {
 				continue
 			}
-			// Can't set Owners on upload so need to set afterwards
-			callbackFns = append(callbackFns, func(info *drive.File) error {
-				// updateInfo.Owners = []*drive.User{
-				// 	{EmailAddress: v},
-				// }
-				fs.Debugf(nil, "FIXME Not writing %v = %q", k, v)
-				return nil
+			// Can't set Owner on upload so need to set afterwards
+			callbackFns = append(callbackFns, func(ctx context.Context, info *drive.File) error {
+				return f.setOwner(ctx, info, v)
 			})
 		case "permissions":
-			if f.opt.MetadataPermissions.IsSet(rwWrite) {
+			if !f.opt.MetadataPermissions.IsSet(rwWrite) {
 				continue
 			}
 			var perms []*drive.Permission
@@ -435,19 +548,21 @@ func (f *Fs) updateMetadata(ctx context.Context, updateInfo *drive.File, meta fs
 				return nil, fmt.Errorf("failed to unmarshal permissions: %w", err)
 			}
 			// Can't set Permissions on upload so need to set afterwards
-			callbackFns = append(callbackFns, func(info *drive.File) error {
-				fs.Debugf(nil, "FIXME Not writing %v = %q", k, v)
-				spew.Dump(perms)
-				return nil
+			callbackFns = append(callbackFns, func(ctx context.Context, info *drive.File) error {
+				return f.setPermissions(ctx, info, perms)
 			})
 		case "labels":
-			if f.opt.MetadataLabels.IsSet(rwWrite) {
+			if !f.opt.MetadataLabels.IsSet(rwWrite) {
 				continue
 			}
+			var labels []*drive.Label
+			err := json.Unmarshal([]byte(v), &labels)
+			if err != nil {
+				return nil, fmt.Errorf("failed to unmarshal labels: %w", err)
+			}
 			// Can't set Labels on upload so need to set afterwards
-			callbackFns = append(callbackFns, func(info *drive.File) error {
-				fs.Debugf(nil, "FIXME Not writing %v = %q", k, v)
-				return nil
+			callbackFns = append(callbackFns, func(ctx context.Context, info *drive.File) error {
+				return f.setLabels(ctx, info, labels)
 			})
 		case "folder-color-rgb":
 			updateInfo.FolderColorRgb = v
