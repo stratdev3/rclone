@@ -76,7 +76,7 @@ require (
 	golang.org/x/time v0.3.0
 	google.golang.org/api v0.134.0
 	gopkg.in/yaml.v2 v2.4.0
-	storj.io/uplink v1.12.0
+	storj.io/uplink v1.12.1
 )
 
 require (
@@ -146,7 +146,7 @@ require (
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/shoenig/go-m1cpu v0.1.6 // indirect
 	github.com/sony/gobreaker v0.5.0 // indirect
-	github.com/spacemonkeygo/monkit/v3 v3.0.20-0.20230227152157-d00b379de191 // indirect
+	github.com/spacemonkeygo/monkit/v3 v3.0.22 // indirect
 	github.com/tklauser/go-sysconf v0.3.11 // indirect
 	github.com/tklauser/numcpus v0.6.0 // indirect
 	github.com/vivint/infectious v0.0.0-20200605153912-25a574ae18a3 // indirect
@@ -161,7 +161,7 @@ require (
 	google.golang.org/grpc v1.56.2 // indirect
 	google.golang.org/protobuf v1.31.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	storj.io/common v0.0.0-20230907123639-5fd0608fd947 // indirect
+	storj.io/common v0.0.0-20230920095429-0ce0a575e6f8 // indirect
 	storj.io/drpc v0.0.33 // indirect
 	storj.io/picobuf v0.0.2-0.20230906122608-c4ba17033c6c // indirect
 )
