@@ -47,6 +47,7 @@ import (
 	"github.com/rclone/rclone/lib/readers"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	"golang.org/x/time/rate"
 	drive_v2 "google.golang.org/api/drive/v2"
 	drive "google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
@@ -69,12 +70,14 @@ const (
 	defaultScope                = "drive"
 	// chunkSize is the size of the chunks created during a resumable upload and should be a power of two.
 	// 1<<18 is the minimum size supported by the Google uploader, and there is no maximum.
-	minChunkSize     = fs.SizeSuffix(googleapi.MinUploadChunkSize)
-	defaultChunkSize = 8 * fs.Mebi
-	partialFields    = "id,name,size,md5Checksum,sha1Checksum,sha256Checksum,trashed,explicitlyTrashed,modifiedTime,createdTime,mimeType,parents,webViewLink,shortcutDetails,exportLinks,resourceKey"
-	listRGrouping    = 50   // number of IDs to search at once when using ListR
-	listRInputBuffer = 1000 // size of input buffer when using ListR
-	defaultXDGIcon   = "text-html"
+	minChunkSize          = fs.SizeSuffix(googleapi.MinUploadChunkSize)
+	defaultChunkSize      = 8 * fs.Mebi
+	partialFields         = "id,name,size,md5Checksum,sha1Checksum,sha256Checksum,trashed,explicitlyTrashed,modifiedTime,createdTime,mimeType,parents,webViewLink,shortcutDetails,exportLinks,resourceKey"
+	listRGrouping         = 50   // number of IDs to search at once when using ListR
+	listRInputBuffer      = 1000 // size of input buffer when using ListR
+	defaultXDGIcon        = "text-html"
+	uploadsPerSecond      = 3.0 // default number of uploads per second
+	uploadsPerSecondBurst = 3   // burst for the above
 )
 
 // Globals
@@ -520,6 +523,16 @@ need to use --ignore size also.`,
 			Help:     "Number of API calls to allow without sleeping.",
 			Advanced: true,
 		}, {
+			Name:     "uploads_per_second",
+			Default:  uploadsPerSecond,
+			Help:     "Number of uploads per second limit.",
+			Advanced: true,
+		}, {
+			Name:     "uploads_per_second_burst",
+			Default:  uploadsPerSecondBurst,
+			Help:     "Burst for number of uploads per second limit.",
+			Advanced: true,
+		}, {
 			Name:    "server_side_across_configs",
 			Default: false,
 			Help: `Deprecated: use --server-side-across-configs instead.
@@ -707,6 +720,8 @@ type Options struct {
 	V2DownloadMinSize         fs.SizeSuffix        `config:"v2_download_min_size"`
 	PacerMinSleep             fs.Duration          `config:"pacer_min_sleep"`
 	PacerBurst                int                  `config:"pacer_burst"`
+	UploadsPerSecond          float64              `config:"uploads_per_second"`
+	UploadsPerSecondBurst     int                  `config:"uploads_per_second_burst"`
 	ServerSideAcrossConfigs   bool                 `config:"server_side_across_configs"`
 	DisableHTTP2              bool                 `config:"disable_http2"`
 	StopOnUploadLimit         bool                 `config:"stop_on_upload_limit"`
@@ -742,6 +757,7 @@ type Fs struct {
 	listRmu          *sync.Mutex         // protects listRempties
 	listRempties     map[string]struct{} // IDs of supposedly empty directories which triggered grouping disable
 	dirResourceKeys  *sync.Map           // map directory ID to resource key
+	uploadsLimiter   *rate.Limiter       // rate limit uploads
 }
 
 type baseObject struct {
@@ -1275,6 +1291,7 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 		listRmu:         new(sync.Mutex),
 		listRempties:    make(map[string]struct{}),
 		dirResourceKeys: new(sync.Map),
+		uploadsLimiter:  rate.NewLimiter(rate.Limit(opt.UploadsPerSecond), opt.UploadsPerSecondBurst),
 	}
 	f.isTeamDrive = opt.TeamDriveID != ""
 	f.fileFields = f.getFileFields()
@@ -2329,6 +2346,7 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 		// Make the API request to upload metadata and file data.
 		// Don't retry, return a retry error instead
 		err = f.pacer.CallNoRetry(func() (bool, error) {
+			_ = f.uploadsLimiter.Wait(ctx) // obey upslimit
 			info, err = f.svc.Files.Create(createInfo).
 				Media(in, googleapi.ContentType(srcMimeType), googleapi.ChunkSize(0)).
 				Fields(partialFields).
